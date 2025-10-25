@@ -1,9 +1,9 @@
 """
 Hyperliquid Whale Watcher Agent - Agentverse Deployment Version
 A Fetch.ai uAgent for detecting whale deposits and analyzing Hyperliquid trading data
-Uses Blockscout MCP for blockchain data access
+Uses external Blockscout MCP server for blockchain data access
 
-This is the clean version ready for deployment to Agentverse.
+This version uses proper MCP integration with external MCP server connection.
 """
 
 import json
@@ -13,8 +13,27 @@ import aiohttp
 import requests
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
-from uagents import Agent, Context, Model
+from uuid import uuid4
+from openai import OpenAI
+from uagents import Agent, Context, Model, Protocol
 from pydantic import BaseModel
+
+# Import chat protocol for ASI:One compatibility
+from uagents_core.contrib.protocols.chat import (
+    ChatMessage,
+    ChatAcknowledgement,
+    TextContent,
+    EndSessionContent,
+    chat_protocol_spec
+)
+
+# Import MCP components for external server connection
+try:
+    from uagents.mcp import MCPClient, MCPServerAdapter
+    MCP_AVAILABLE = True
+except ImportError:
+    print("MCP components not available - falling back to direct API calls")
+    MCP_AVAILABLE = False
 
 # Configuration Constants
 BRIDGE_CONTRACT_ADDRESS = "0x2Df1c51E09aECF9cacB7bc98cB1742757f163dF7"
@@ -50,6 +69,9 @@ class WhaleQueryRequest(Model):
 
 class WhaleQueryResponse(Model):
     response: str
+
+class TextMessage(Model):
+    content: str
 
 class WhaleDetectionRequest(Model):
     threshold_usd: Optional[float] = ALERT_THRESHOLD_USD
@@ -92,57 +114,90 @@ class EnrichedWallet:
         self.recent_fills = recent_fills
         self.total_notional_usd = total_notional_usd
 
-# Blockscout MCP Client
+# Blockscout MCP Client - Updated for External MCP Server Connection
 class BlockscoutMCPClient:
     def __init__(self, mcp_url: str = BLOCKSCOUT_MCP_URL):
         self.mcp_url = mcp_url
+        self.mcp_client = None
         self.session = None
 
+    async def _initialize_mcp_client(self):
+        """Initialize MCP client connection to external Blockscout MCP server"""
+        if MCP_AVAILABLE and self.mcp_client is None:
+            try:
+                # Connect to external Blockscout MCP server
+                self.mcp_client = MCPClient(server_url=self.mcp_url)
+                await self.mcp_client.connect()
+                print(f"Connected to Blockscout MCP server at {self.mcp_url}")
+                return True
+            except Exception as e:
+                print(f"Failed to connect to MCP server: {e}")
+                self.mcp_client = None
+                return False
+        return self.mcp_client is not None
+
     async def _get_session(self):
-        """Get or create aiohttp session"""
+        """Get or create aiohttp session for fallback HTTP requests"""
         if self.session is None:
             self.session = aiohttp.ClientSession()
         return self.session
 
-    async def _make_mcp_request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Make a JSON-RPC request to the Blockscout MCP API"""
+    async def _call_mcp_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Call a tool on the external Blockscout MCP server"""
         try:
-            print(f"Making MCP request: {method} with params: {params}")
-            
+            if await self._initialize_mcp_client():
+                # Use MCP client to call tool
+                result = await self.mcp_client.call_tool(tool_name, arguments)
+                print(f"MCP tool {tool_name} called successfully")
+                return result
+            else:
+                raise Exception("MCP client not available")
+        except Exception as e:
+            print(f"MCP tool call failed for {tool_name}: {e}")
+            # Fallback to direct HTTP if MCP fails
+            return await self._fallback_http_request(tool_name, arguments)
+
+    async def _fallback_http_request(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Fallback to direct HTTP requests if MCP is not available"""
+        try:
+            print(f"Using HTTP fallback for {tool_name}")
             session = await self._get_session()
-            request_data = {
-                "jsonrpc": "2.0",
-                "method": method,
-                "params": params,
-                "id": 1
-            }
             
-            async with session.post(
-                self.mcp_url,
-                headers={"Content-Type": "application/json"},
-                json=request_data,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                response.raise_for_status()
-                data = await response.json()
+            # Map MCP tool calls to HTTP endpoints
+            if tool_name == "get_transactions_by_address":
+                # Use Blockscout API directly
+                chain_id = arguments.get("chain_id", ARBITRUM_CHAIN_ID)
+                address = arguments.get("address")
                 
-                if "error" in data:
-                    print(f"MCP API error: {data['error']}")
-                    raise Exception(f"MCP API error: {data['error']}")
+                url = f"https://arbitrum.blockscout.com/api/v2/addresses/{address}/transactions"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    return data
+            
+            elif tool_name == "get_address_info":
+                # Get address information
+                chain_id = arguments.get("chain_id", ARBITRUM_CHAIN_ID)
+                address = arguments.get("address")
                 
-                print(f"MCP response received for {method}")
-                return data.get("result", {})
+                url = f"https://arbitrum.blockscout.com/api/v2/addresses/{address}"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    return data
+            
+            else:
+                raise Exception(f"Unknown tool: {tool_name}")
                 
         except Exception as e:
-            print(f"MCP request failed for {method}: {e}")
-            raise e
+            print(f"HTTP fallback failed for {tool_name}: {e}")
+            return {}
 
     async def get_recent_bridge_transactions(self, lookback_minutes: int = LOOKBACK_MINUTES_DEFAULT) -> List[Dict]:
-        """Fetch recent transactions to the Hyperliquid bridge contract using MCP"""
+        """Fetch recent transactions to the Hyperliquid bridge contract using MCP tools"""
         try:
-            # Use MCP to get transactions by address
-            # Note: Blockscout MCP API uses different parameters than expected
-            result = await self._make_mcp_request(
+            # Use Blockscout MCP tool to get transactions by address
+            result = await self._call_mcp_tool(
                 "get_transactions_by_address",
                 {
                     "chain_id": ARBITRUM_CHAIN_ID,
@@ -150,13 +205,12 @@ class BlockscoutMCPClient:
                 }
             )
             
-            # Filter transactions by time if needed (client-side filtering)
+            # Filter transactions by time (client-side filtering)
             current_time = int(time.time())
             cutoff_time = current_time - (lookback_minutes * 60)
             
             transactions = result.get("items", [])
             if isinstance(transactions, list):
-                # Filter by timestamp if available
                 filtered_transactions = []
                 for tx in transactions:
                     tx_timestamp = tx.get("timestamp")
@@ -180,7 +234,7 @@ class BlockscoutMCPClient:
             
             return transactions if isinstance(transactions, list) else []
         except Exception as e:
-            print(f"Error fetching bridge transactions via MCP: {e}")
+            print(f"Error fetching bridge transactions: {e}")
             return []
 
     def decode_deposit_event(self, transaction: Dict) -> Optional[Dict[str, str]]:
@@ -232,7 +286,7 @@ class BlockscoutMCPClient:
             return 0.0
 
     async def get_recent_whales(self, threshold_usd: float = ALERT_THRESHOLD_USD, lookback_minutes: int = LOOKBACK_MINUTES_DEFAULT) -> List[WhaleDeposit]:
-        """Get recent whale deposits above threshold using MCP"""
+        """Get recent whale deposits above threshold using MCP tools"""
         whales = []
         
         try:
@@ -266,11 +320,31 @@ class BlockscoutMCPClient:
             return whales
             
         except Exception as e:
-            print(f"Error getting recent whales via MCP: {e}")
+            print(f"Error getting recent whales: {e}")
             return []
 
+    async def get_address_info(self, address: str) -> Dict[str, Any]:
+        """Get detailed address information using MCP tools"""
+        try:
+            result = await self._call_mcp_tool(
+                "get_address_info",
+                {
+                    "chain_id": ARBITRUM_CHAIN_ID,
+                    "address": address
+                }
+            )
+            return result
+        except Exception as e:
+            print(f"Error getting address info for {address}: {e}")
+            return {}
+
     async def close(self):
-        """Close the aiohttp session"""
+        """Close connections"""
+        if self.mcp_client:
+            try:
+                await self.mcp_client.disconnect()
+            except:
+                pass
         if self.session:
             await self.session.close()
 
@@ -408,73 +482,193 @@ class HyperliquidClient:
         
         return summary
 
-# Initialize clients
-blockscout_client = BlockscoutMCPClient()
-hyperliquid_client = HyperliquidClient()
+# ASI:One API key configuration - hardcoded as per documentation
+ASI_ONE_API_KEY = "sk_fb3d2f75d420447aa0b66a187cc8edf78ede76314e3949e5860037bab3dca0d1"  # Replace with your actual ASI:One API key
 
-# Create the uAgent for Agentverse deployment
+# Initialize OpenAI client for ASI:One integration - following official example
+openai_client = OpenAI(
+    # By default, we are using the ASI-1 LLM endpoint and model
+    base_url='https://api.asi1.ai/v1',
+    
+    # You can get an ASI-1 api key by creating an account at https://asi1.ai/dashboard/api-keys
+    api_key=ASI_ONE_API_KEY,
+)
+
+# Create the uAgent for Agentverse deployment with MCP integration
 agent = Agent(
     name="hyperliquid_whale_watcher",
     seed="hyperliquid_whale_detection_seed_phrase_2024"
 )
+
+# Create chat protocol for ASI:One compatibility - following official documentation
+# IMPORTANT: This must be created BEFORE any message handlers that use it
+protocol = Protocol(spec=chat_protocol_spec)
+
+# Initialize MCP-enabled clients
+blockscout_client = BlockscoutMCPClient()
+hyperliquid_client = HyperliquidClient()
 
 @agent.on_event("startup")
 async def startup_handler(ctx: Context):
     ctx.logger.info(f"🐋 Hyperliquid Whale Watcher Agent started!")
     ctx.logger.info(f"Agent address: {agent.address}")
     ctx.logger.info(f"Monitoring deposits above ${ALERT_THRESHOLD_USD:,}")
-
-@agent.on_message(model=WhaleQueryRequest)
-async def handle_whale_query(ctx: Context, sender: str, msg: WhaleQueryRequest):
-    """Handle general whale queries"""
-    ctx.logger.info(f"Received whale query from {sender}: {msg.query}")
     
+    # Test MCP connection
+    if MCP_AVAILABLE:
+        try:
+            await blockscout_client._initialize_mcp_client()
+            ctx.logger.info("✅ MCP connection to Blockscout server established")
+        except Exception as e:
+            ctx.logger.warning(f"⚠️ MCP connection failed, using HTTP fallback: {e}")
+    else:
+        ctx.logger.info("📡 Using HTTP fallback for blockchain data access")
+
+@agent.on_event("shutdown")
+async def shutdown_handler(ctx: Context):
+    ctx.logger.info("🛑 Shutting down Whale Watcher Agent")
+    await blockscout_client.close()
+    if hasattr(hyperliquid_client, 'session') and hyperliquid_client.session:
+        await hyperliquid_client.session.close()
+
+# Chat message handler for ASI:One compatibility
+@protocol.on_message(ChatMessage)
+async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
+    """Handle incoming chat messages from ASI:One - following exact documentation pattern"""
+    # Send the acknowledgement for receiving the message
+    await ctx.send(
+        sender,
+        ChatAcknowledgement(timestamp=datetime.now(), acknowledged_msg_id=msg.msg_id),
+    )
+
+    # Collect up all the text chunks
+    text = ''
+    for item in msg.content:
+        if isinstance(item, TextContent):
+            text += item.text
+
+    # Query the model based on the user question
+    response = 'I am afraid something went wrong and I am unable to answer your question at the moment'
+    try:
+        if text:
+            ctx.logger.info(f"Processing whale query: {text}")
+            
+            # Process whale-related queries
+            if any(keyword in text.lower() for keyword in ["whale", "deposit", "recent", "activity"]):
+                # Get recent whale activity
+                whales = await blockscout_client.get_recent_whales()
+                if whales:
+                    response = f"🐋 **Recent Whale Activity** (Last {LOOKBACK_MINUTES_DEFAULT} minutes):\n\n"
+                    for i, whale in enumerate(whales[:5], 1):
+                        response += f"{i}. **${whale.amount_usd:,.0f}** {whale.token} deposit\n"
+                        response += f"   Wallet: `{whale.wallet[:6]}...{whale.wallet[-4:]}`\n"
+                        response += f"   TX: `{whale.tx_hash[:10]}...`\n\n"
+                else:
+                    response = f"No whale deposits above ${ALERT_THRESHOLD_USD:,} found in the last {LOOKBACK_MINUTES_DEFAULT} minutes."
+            
+            elif "wallet" in text.lower() or "address" in text.lower():
+                # Extract potential wallet address from text
+                import re
+                wallet_pattern = r'0x[a-fA-F0-9]{40}'
+                matches = re.findall(wallet_pattern, text)
+                if matches:
+                    wallet_address = matches[0]
+                    enriched = await hyperliquid_client.enrich_wallet(wallet_address)
+                    response = hyperliquid_client.format_wallet_summary(enriched)
+                else:
+                    response = "Please provide a valid wallet address (0x...) to analyze."
+            
+            else:
+                response = f"""🐋 **Hyperliquid Whale Watcher**
+
+I monitor large deposits to Hyperliquid and analyze trading activity. Here's what I can help with:
+
+• **Recent whale activity**: Ask about "recent whales" or "whale deposits"
+• **Wallet analysis**: Provide a wallet address to see Hyperliquid positions and trades
+• **Deposit monitoring**: I track deposits above ${ALERT_THRESHOLD_USD:,}
+
+What would you like to know?"""
+
+    except Exception as e:
+        ctx.logger.error(f"Error processing message: {e}")
+        response = 'I am afraid something went wrong and I am unable to answer your question at the moment'
+
+    # Send response back as ChatMessage
+    await ctx.send(
+        sender,
+        ChatMessage(
+            timestamp=datetime.utcnow(),
+            msg_id=uuid4(),
+            content=[
+                # we send the contents back in the chat message
+                TextContent(type="text", text=response),
+                # we also signal that the session is over, this also informs the user that we are not recording any of the
+                # previous history of messages.
+                EndSessionContent(type="end-session"),
+            ]
+        )
+    )
+
+
+@protocol.on_message(ChatAcknowledgement)
+async def handle_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
+    # we are not interested in the acknowledgements for this example, but they can be useful to
+    # implement read receipts, for example.
+    pass
+
+async def handle_whale_query_internal(ctx: Context, sender: str, msg: WhaleQueryRequest):
+    """Internal handler for whale queries"""
     query_lower = msg.query.lower()
     
     try:
         # Check if asking for recent whales
         if any(keyword in query_lower for keyword in ["whale", "deposit", "recent", "activity"]):
             ctx.logger.info("Processing recent whale activity request")
-            try:
-                whales = await blockscout_client.get_recent_whales()
-                ctx.logger.info(f"Found {len(whales)} whale deposits")
+            
+            whales = await blockscout_client.get_recent_whales()
+            
+            if whales:
+                response = f"🐋 **Recent Whale Activity** (${ALERT_THRESHOLD_USD:,}+ deposits)\n\n"
+                for i, whale in enumerate(whales[:5], 1):
+                    response += f"{i}. **${whale.amount_usd:,.0f}** {whale.token}\n"
+                    response += f"   Wallet: `{whale.wallet[:6]}...{whale.wallet[-4:]}`\n"
+                    response += f"   Time: {datetime.fromtimestamp(whale.timestamp).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
                 
-                if not whales:
-                    response = f"No whale deposits above ${ALERT_THRESHOLD_USD:,} found in the last {LOOKBACK_MINUTES_DEFAULT} minutes."
-                else:
-                    response = f"🐋 **{len(whales)} Whale Deposits Detected:**\n\n"
-                    for whale in whales[:5]:  # Show top 5
-                        response += f"• **${whale.amount_usd:,.0f}** {whale.token} deposit\n"
-                        response += f"  Wallet: `{whale.wallet[:6]}...{whale.wallet[-4:]}`\n"
-                        response += f"  TX: `{whale.tx_hash[:10]}...`\n\n"
-                        
-                    # Try to enrich the largest whale
-                    if whales:
-                        largest_whale = max(whales, key=lambda w: w.amount_usd)
-                        ctx.logger.info(f"Enriching largest whale: {largest_whale.wallet}")
-                        try:
-                            enriched = await hyperliquid_client.enrich_wallet(largest_whale.wallet)
-                            response += f"**Analysis of largest whale ({largest_whale.wallet[:10]}...):**\n"
-                            response += hyperliquid_client.format_wallet_summary(enriched)
-                        except Exception as e:
-                            ctx.logger.error(f"Failed to enrich wallet {largest_whale.wallet}: {e}")
-                            response += f"*Note: Unable to fetch Hyperliquid trading data for analysis.*"
-                            
-            except Exception as e:
-                ctx.logger.error(f"Error fetching whale data: {e}")
-                response = f"I encountered an error while fetching whale data: {str(e)}. This might be due to API limitations in the Agentverse environment."
+                if len(whales) > 5:
+                    response += f"... and {len(whales) - 5} more whale deposits\n"
+            else:
+                response = f"No whale deposits above ${ALERT_THRESHOLD_USD:,} found in the last {LOOKBACK_MINUTES_DEFAULT} minutes."
         
-        # Check for wallet address
-        elif "0x" in msg.query and len(msg.query) >= 42:
-            # Extract wallet address
-            import re
-            wallet_match = re.search(r'0x[a-fA-F0-9]{40}', msg.query)
-            if wallet_match:
-                wallet_address = wallet_match.group(0)
-                ctx.logger.info(f"Analyzing wallet: {wallet_address}")
+        # Check if it's a wallet address (starts with 0x and is 42 characters)
+        elif msg.query.startswith("0x") and len(msg.query) == 42:
+            ctx.logger.info(f"Processing wallet analysis request for {msg.query}")
+            wallet_address = msg.query
+            
+            # Validate wallet address format
+            if all(c in "0123456789abcdefABCDEF" for c in wallet_address[2:]):
                 try:
+                    # Get blockchain info from Blockscout MCP
+                    address_info = await blockscout_client.get_address_info(wallet_address)
+                    
+                    # Get Hyperliquid trading data
                     enriched_wallet = await hyperliquid_client.enrich_wallet(wallet_address)
-                    response = hyperliquid_client.format_wallet_summary(enriched_wallet)
+                    
+                    response = f"📊 **Comprehensive Wallet Analysis: {wallet_address[:6]}...{wallet_address[-4:]}**\n\n"
+                    
+                    # Add blockchain information
+                    if address_info:
+                        balance = address_info.get("coin_balance", "0")
+                        if balance and balance != "0":
+                            eth_balance = float(balance) / 1e18
+                            response += f"💰 **On-chain Balance:** {eth_balance:.4f} ETH\n"
+                        
+                        tx_count = address_info.get("transactions_count", 0)
+                        if tx_count:
+                            response += f"📈 **Transaction Count:** {tx_count:,}\n"
+                    
+                    response += "\n"
+                    response += hyperliquid_client.format_wallet_summary(enriched_wallet)
+                    
                 except Exception as e:
                     ctx.logger.error(f"Error analyzing wallet {wallet_address}: {e}")
                     response = f"Error analyzing wallet {wallet_address}: {str(e)}"
@@ -491,11 +685,20 @@ async def handle_whale_query(ctx: Context, sender: str, msg: WhaleQueryRequest):
 
 What would you like to know about whale activity?"""
         
-        await ctx.send(sender, WhaleQueryResponse(response=response))
+        # Send response as ChatMessage with TextContent for ASI:One compatibility
+        chat_response = ChatMessage(
+            content=TextContent(text=response),
+            id=f"response_{int(time.time())}"
+        )
+        await ctx.send(sender, chat_response)
         
     except Exception as e:
         ctx.logger.error(f"Error handling query: {e}")
-        await ctx.send(sender, WhaleQueryResponse(response=f"Sorry, I encountered an error processing your request: {str(e)}. Please try again."))
+        error_response = ChatMessage(
+            content=TextContent(text=f"Sorry, I encountered an error processing your request: {str(e)}. Please try again."),
+            id=f"error_{int(time.time())}"
+        )
+        await ctx.send(sender, error_response)
 
 @agent.on_message(model=WhaleDetectionRequest)
 async def handle_whale_detection(ctx: Context, sender: str, msg: WhaleDetectionRequest):
@@ -547,6 +750,10 @@ async def handle_wallet_enrichment(ctx: Context, sender: str, msg: WalletEnrichm
     except Exception as e:
         ctx.logger.error(f"Error enriching wallet: {e}")
         await ctx.send(sender, WhaleQueryResponse(response=f"Error enriching wallet {msg.wallet_address}: {str(e)}"))
+
+# Include the chat protocol in the agent with manifest publishing for ASI:One compatibility
+# This must be done AFTER all message handlers are defined
+agent.include(protocol, publish_manifest=True)
 
 if __name__ == "__main__":
     print("🐋 Starting Hyperliquid Whale Watcher Agent...")
