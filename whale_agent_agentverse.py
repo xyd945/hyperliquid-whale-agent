@@ -27,22 +27,20 @@ from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec
 )
 
-# Import MCP components for external server connection
-try:
-    from uagents.mcp import MCPClient, MCPServerAdapter
-    MCP_AVAILABLE = True
-except ImportError:
-    print("MCP components not available - falling back to direct API calls")
-    MCP_AVAILABLE = False
+# FastMCP uAgent integration - no direct MCP imports needed
+# We'll communicate with the FastMCP uAgent via uAgent protocol
 
 # Configuration Constants
 BRIDGE_CONTRACT_ADDRESS = "0x2Df1c51E09aECF9cacB7bc98cB1742757f163dF7"
 BLOCKSCOUT_MCP_URL = "https://mcp.blockscout.com/mcp"
 HYPERLIQUID_INFO_ENDPOINT = "https://api.hyperliquid.xyz/info"
-ALERT_THRESHOLD_USD = 10_000_000  # $10M
-LOOKBACK_MINUTES_DEFAULT = 15
+ALERT_THRESHOLD_USD = 100_000  # $100K (reduced from $10M for better detection)
+LOOKBACK_MINUTES_DEFAULT = 60  # 1 hour (increased from 15 minutes)
 DEPOSIT_EVENT_SIGNATURE = "0x5548c837ab068cf56a2c2479df0882a4922fd203edb7517321831d95078c5f62"
 ARBITRUM_CHAIN_ID = 42161
+
+# FastMCP uAgent Configuration
+FASTMCP_AGENT_ADDRESS = "agent1q2mx6n23zjppzzpcf06gh9u8k2gu6fd4jnzytnvkvwf6zrh0frvnz274uyp"  # Your FastMCP agent address
 
 # Token Information
 TOKEN_INFO = {
@@ -80,6 +78,16 @@ class WhaleDetectionRequest(Model):
 class WalletEnrichmentRequest(Model):
     wallet_address: str
 
+# FastMCP uAgent Communication Models
+class MCPToolRequest(Model):
+    tool_name: str
+    arguments: Dict[str, Any]
+
+class MCPToolResponse(Model):
+    success: bool
+    result: Dict[str, Any]
+    error: Optional[str] = None
+
 # Data Classes
 class WhaleDeposit:
     def __init__(self, wallet: str, amount: str, token: str, tx_hash: str, timestamp: int, amount_usd: float):
@@ -114,27 +122,16 @@ class EnrichedWallet:
         self.recent_fills = recent_fills
         self.total_notional_usd = total_notional_usd
 
-# Blockscout MCP Client - Updated for External MCP Server Connection
+# Blockscout MCP Client - Updated for FastMCP uAgent Communication
 class BlockscoutMCPClient:
-    def __init__(self, mcp_url: str = BLOCKSCOUT_MCP_URL):
-        self.mcp_url = mcp_url
-        self.mcp_client = None
+    def __init__(self, fastmcp_agent_address: str = FASTMCP_AGENT_ADDRESS):
+        self.fastmcp_agent_address = fastmcp_agent_address
         self.session = None
+        self.context = None  # Will be set by the agent
 
-    async def _initialize_mcp_client(self):
-        """Initialize MCP client connection to external Blockscout MCP server"""
-        if MCP_AVAILABLE and self.mcp_client is None:
-            try:
-                # Connect to external Blockscout MCP server
-                self.mcp_client = MCPClient(server_url=self.mcp_url)
-                await self.mcp_client.connect()
-                print(f"Connected to Blockscout MCP server at {self.mcp_url}")
-                return True
-            except Exception as e:
-                print(f"Failed to connect to MCP server: {e}")
-                self.mcp_client = None
-                return False
-        return self.mcp_client is not None
+    def set_context(self, context: Context):
+        """Set the uAgent context for sending messages"""
+        self.context = context
 
     async def _get_session(self):
         """Get or create aiohttp session for fallback HTTP requests"""
@@ -143,19 +140,63 @@ class BlockscoutMCPClient:
         return self.session
 
     async def _call_mcp_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Call a tool on the external Blockscout MCP server"""
+        """Call a tool via the FastMCP uAgent"""
+        print(f"🔧 FastMCP Tool Call: {tool_name} with args: {arguments}")
+        
         try:
-            if await self._initialize_mcp_client():
-                # Use MCP client to call tool
-                result = await self.mcp_client.call_tool(tool_name, arguments)
-                print(f"MCP tool {tool_name} called successfully")
-                return result
+            if self.context:
+                # Send request to FastMCP uAgent
+                print(f"📡 Sending request to FastMCP uAgent: {self.fastmcp_agent_address}")
+                print(f"🔍 DEBUG: FastMCP address type: {type(self.fastmcp_agent_address)}")
+                print(f"🔍 DEBUG: FastMCP address value: '{self.fastmcp_agent_address}'")
+                print(f"🔍 DEBUG: FastMCP address length: {len(self.fastmcp_agent_address)}")
+                
+                request = MCPToolRequest(
+                    tool_name=tool_name,
+                    arguments=arguments
+                )
+                
+                print(f"🔍 DEBUG: Sending MCPToolRequest: {request}")
+                print(f"🔍 DEBUG: Request model fields: {request.model_fields}")
+                
+                # Send message and wait for response
+                response = await self.context.send(
+                    self.fastmcp_agent_address,
+                    request,
+                    timeout=30.0
+                )
+                
+                print(f"🔍 DEBUG: Received response type: {type(response)}")
+                print(f"🔍 DEBUG: Response content: {response}")
+                
+                if isinstance(response, MCPToolResponse):
+                    if response.success:
+                        print(f"✅ FastMCP result for {tool_name}: {type(response.result)} - {len(str(response.result))} chars")
+                        if isinstance(response.result, dict) and "items" in response.result:
+                            print(f"📊 Found {len(response.result.get('items', []))} items in FastMCP response")
+                        return response.result
+                    else:
+                        print(f"❌ FastMCP tool call failed for {tool_name}: {response.error}")
+                        raise Exception(f"FastMCP error: {response.error}")
+                else:
+                    print(f"❌ Unexpected response type from FastMCP: {type(response)}")
+                    print(f"🔍 DEBUG: Response details: {response}")
+                    raise Exception(f"Unexpected response type: {type(response)}")
             else:
-                raise Exception("MCP client not available")
+                print(f"❌ No context available for FastMCP communication")
+                raise Exception("No context available for FastMCP communication")
+                
         except Exception as e:
-            print(f"MCP tool call failed for {tool_name}: {e}")
-            # Fallback to direct HTTP if MCP fails
-            return await self._fallback_http_request(tool_name, arguments)
+            print(f"❌ FastMCP tool call failed for {tool_name}: {e}")
+            # Fallback to direct HTTP if FastMCP fails
+            print(f"🔄 Falling back to HTTP for {tool_name}")
+            try:
+                result = await self._fallback_http_request(tool_name, arguments)
+                print(f"✅ HTTP fallback successful for {tool_name}")
+                return result
+            except Exception as fallback_error:
+                print(f"❌ HTTP fallback also failed for {tool_name}: {fallback_error}")
+                return {}
 
     async def _fallback_http_request(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Fallback to direct HTTP requests if MCP is not available"""
@@ -195,6 +236,8 @@ class BlockscoutMCPClient:
 
     async def get_recent_bridge_transactions(self, lookback_minutes: int = LOOKBACK_MINUTES_DEFAULT) -> List[Dict]:
         """Fetch recent transactions to the Hyperliquid bridge contract using MCP tools"""
+        print(f"🔍 Fetching bridge transactions for {BRIDGE_CONTRACT_ADDRESS} (last {lookback_minutes} minutes)")
+        
         try:
             # Use Blockscout MCP tool to get transactions by address
             result = await self._call_mcp_tool(
@@ -205,15 +248,22 @@ class BlockscoutMCPClient:
                 }
             )
             
+            print(f"📥 Raw result type: {type(result)}, keys: {list(result.keys()) if isinstance(result, dict) else 'N/A'}")
+            
             # Filter transactions by time (client-side filtering)
             current_time = int(time.time())
             cutoff_time = current_time - (lookback_minutes * 60)
+            print(f"⏰ Time filter: current={current_time}, cutoff={cutoff_time}")
             
             transactions = result.get("items", [])
+            print(f"📋 Found {len(transactions)} total transactions")
+            
             if isinstance(transactions, list):
                 filtered_transactions = []
-                for tx in transactions:
+                for i, tx in enumerate(transactions):
                     tx_timestamp = tx.get("timestamp")
+                    print(f"🔍 TX {i}: hash={tx.get('hash', 'N/A')[:10]}..., timestamp={tx_timestamp}")
+                    
                     if tx_timestamp:
                         # Convert timestamp to unix timestamp if needed
                         if isinstance(tx_timestamp, str):
@@ -221,83 +271,120 @@ class BlockscoutMCPClient:
                                 from datetime import datetime
                                 dt = datetime.fromisoformat(tx_timestamp.replace('Z', '+00:00'))
                                 tx_timestamp = int(dt.timestamp())
-                            except:
+                                print(f"  ⏰ Converted timestamp: {tx_timestamp}")
+                            except Exception as ts_error:
+                                print(f"  ❌ Timestamp conversion failed: {ts_error}")
                                 continue
                         
                         if tx_timestamp >= cutoff_time:
                             filtered_transactions.append(tx)
+                            print(f"  ✅ TX included (within time range)")
+                        else:
+                            print(f"  ⏭️ TX skipped (too old: {current_time - tx_timestamp}s ago)")
                     else:
                         # If no timestamp, include it (better to have false positives)
                         filtered_transactions.append(tx)
+                        print(f"  ⚠️ TX included (no timestamp)")
                 
+                print(f"📊 Filtered to {len(filtered_transactions)} recent transactions")
                 return filtered_transactions[:50]  # Limit to 50 most recent
             
+            print(f"⚠️ Transactions not in expected format: {type(transactions)}")
             return transactions if isinstance(transactions, list) else []
         except Exception as e:
-            print(f"Error fetching bridge transactions: {e}")
+            print(f"❌ Error fetching bridge transactions: {e}")
+            import traceback
+            print(f"🔍 Full traceback: {traceback.format_exc()}")
             return []
 
     def decode_deposit_event(self, transaction: Dict) -> Optional[Dict[str, str]]:
         """Decode deposit event from transaction data"""
         try:
+            print(f"  🔍 Decoding TX: to={transaction.get('to', {}).get('hash', 'N/A')[:10]}..., value={transaction.get('value', '0')}")
+            
             # Check if transaction is to the bridge contract
-            if transaction.get("to", {}).get("hash", "").lower() != BRIDGE_CONTRACT_ADDRESS.lower():
+            to_address = transaction.get("to", {}).get("hash", "")
+            if to_address.lower() != BRIDGE_CONTRACT_ADDRESS.lower():
+                print(f"    ⏭️ Not to bridge contract: {to_address[:10]}... != {BRIDGE_CONTRACT_ADDRESS[:10]}...")
                 return None
+            
+            print(f"    ✅ Transaction is to bridge contract")
             
             # Check transaction value and input data
             value = transaction.get("value", "0")
+            print(f"    💰 Transaction value: {value}")
+            
             if value and value != "0":
                 # This is likely a deposit transaction
                 from_address = transaction.get("from", {}).get("hash", "")
+                print(f"    👤 From address: {from_address[:10]}...{from_address[-4:] if len(from_address) > 10 else ''}")
                 
                 # For simplicity, we'll treat ETH deposits based on value
                 # In a full implementation, we'd decode the input data
-                return {
+                deposit_data = {
                     "user": from_address,
                     "amount": value,
                     "token": "0x0000000000000000000000000000000000000000"  # ETH
                 }
+                print(f"    ✅ Deposit decoded: {deposit_data}")
+                return deposit_data
             
+            print(f"    ⏭️ No value in transaction")
             return None
         except Exception as e:
-            print(f"Error decoding deposit event: {e}")
+            print(f"    ❌ Error decoding deposit event: {e}")
             return None
 
     def convert_to_usd(self, amount: str, token_address: str) -> float:
         """Convert token amount to USD"""
         try:
+            print(f"    💱 Converting to USD: amount={amount}, token={token_address[:10]}...")
+            
             # Find token info by address
             token_info = None
             for symbol, info in TOKEN_INFO.items():
                 if info["address"].lower() == token_address.lower():
                     token_info = info
+                    print(f"      ✅ Found token: {symbol}")
                     break
             
             if not token_info:
+                print(f"      ❌ Token not found in TOKEN_INFO")
                 return 0.0
             
             # Convert hex amount to decimal
             amount_int = int(amount, 16) if amount.startswith("0x") else int(amount)
             amount_decimal = amount_int / (10 ** token_info["decimals"])
+            usd_value = amount_decimal * token_info["usd_rate"]
             
-            return amount_decimal * token_info["usd_rate"]
+            print(f"      💰 Conversion: {amount_int} wei -> {amount_decimal:.6f} {token_info.get('symbol', 'tokens')} -> ${usd_value:,.2f}")
+            
+            return usd_value
         except Exception as e:
-            print(f"Error converting to USD: {e}")
+            print(f"      ❌ Error converting to USD: {e}")
             return 0.0
 
     async def get_recent_whales(self, threshold_usd: float = ALERT_THRESHOLD_USD, lookback_minutes: int = LOOKBACK_MINUTES_DEFAULT) -> List[WhaleDeposit]:
         """Get recent whale deposits above threshold using MCP tools"""
+        print(f"🐋 Starting whale detection: threshold=${threshold_usd:,}, lookback={lookback_minutes}min")
         whales = []
         
         try:
             transactions = await self.get_recent_bridge_transactions(lookback_minutes)
+            print(f"📋 Processing {len(transactions)} transactions for whale detection")
             
-            for tx in transactions:
+            for i, tx in enumerate(transactions):
+                print(f"🔍 Processing TX {i+1}/{len(transactions)}: {tx.get('hash', 'N/A')[:10]}...")
+                
                 deposit_data = self.decode_deposit_event(tx)
                 if deposit_data:
+                    print(f"  💰 Deposit detected: {deposit_data['amount']} of token {deposit_data['token'][:10]}...")
                     amount_usd = self.convert_to_usd(deposit_data["amount"], deposit_data["token"])
+                    print(f"  💵 USD value: ${amount_usd:,.2f}")
                     
                     if amount_usd >= threshold_usd:
+                        print(f"  🐋 WHALE DETECTED! ${amount_usd:,.2f} >= ${threshold_usd:,.2f}")
+                        
                         # Find token symbol
                         token_symbol = "UNKNOWN"
                         for symbol, info in TOKEN_INFO.items():
@@ -314,13 +401,25 @@ class BlockscoutMCPClient:
                             amount_usd=amount_usd
                         )
                         whales.append(whale)
+                        print(f"  ✅ Whale added to list (total: {len(whales)})")
+                    else:
+                        print(f"  ⏭️ Below threshold: ${amount_usd:,.2f} < ${threshold_usd:,.2f}")
+                else:
+                    print(f"  ⏭️ No deposit data found in transaction")
             
             # Sort by amount USD descending
             whales.sort(key=lambda x: x.amount_usd, reverse=True)
+            print(f"🎯 Final result: {len(whales)} whales detected")
+            
+            for i, whale in enumerate(whales):
+                print(f"  🐋 #{i+1}: ${whale.amount_usd:,.2f} {whale.token} from {whale.wallet[:6]}...{whale.wallet[-4:]}")
+            
             return whales
             
         except Exception as e:
-            print(f"Error getting recent whales: {e}")
+            print(f"❌ Error getting recent whales: {e}")
+            import traceback
+            print(f"🔍 Full traceback: {traceback.format_exc()}")
             return []
 
     async def get_address_info(self, address: str) -> Dict[str, Any]:
@@ -340,11 +439,6 @@ class BlockscoutMCPClient:
 
     async def close(self):
         """Close connections"""
-        if self.mcp_client:
-            try:
-                await self.mcp_client.disconnect()
-            except:
-                pass
         if self.session:
             await self.session.close()
 
@@ -513,16 +607,24 @@ async def startup_handler(ctx: Context):
     ctx.logger.info(f"🐋 Hyperliquid Whale Watcher Agent started!")
     ctx.logger.info(f"Agent address: {agent.address}")
     ctx.logger.info(f"Monitoring deposits above ${ALERT_THRESHOLD_USD:,}")
+    ctx.logger.info(f"FastMCP Agent: {FASTMCP_AGENT_ADDRESS}")
+    ctx.logger.info(f"🔍 DEBUG: FASTMCP_AGENT_ADDRESS type: {type(FASTMCP_AGENT_ADDRESS)}")
+    ctx.logger.info(f"🔍 DEBUG: FASTMCP_AGENT_ADDRESS value: '{FASTMCP_AGENT_ADDRESS}'")
+    ctx.logger.info(f"🔍 DEBUG: FASTMCP_AGENT_ADDRESS length: {len(FASTMCP_AGENT_ADDRESS)}")
     
-    # Test MCP connection
-    if MCP_AVAILABLE:
-        try:
-            await blockscout_client._initialize_mcp_client()
-            ctx.logger.info("✅ MCP connection to Blockscout server established")
-        except Exception as e:
-            ctx.logger.warning(f"⚠️ MCP connection failed, using HTTP fallback: {e}")
-    else:
-        ctx.logger.info("📡 Using HTTP fallback for blockchain data access")
+    # Set the context for the blockscout client to enable FastMCP communication
+    blockscout_client.set_context(ctx)
+    ctx.logger.info(f"🔍 DEBUG: blockscout_client.fastmcp_agent_address: '{blockscout_client.fastmcp_agent_address}'")
+    
+    # Test FastMCP connection
+    try:
+        ctx.logger.info("Testing FastMCP connection...")
+        test_result = await blockscout_client._call_mcp_tool("test_connection", {})
+        ctx.logger.info(f"FastMCP connection test result: {test_result}")
+    except Exception as e:
+        ctx.logger.warning(f"FastMCP connection test failed (will use HTTP fallback): {e}")
+    
+    ctx.logger.info("✅ Agent startup complete")
 
 @agent.on_event("shutdown")
 async def shutdown_handler(ctx: Context):
@@ -624,8 +726,10 @@ async def handle_whale_query_internal(ctx: Context, sender: str, msg: WhaleQuery
         # Check if asking for recent whales
         if any(keyword in query_lower for keyword in ["whale", "deposit", "recent", "activity"]):
             ctx.logger.info("Processing recent whale activity request")
+            print(f"🔍 User query: '{msg.query}' - Processing whale activity request")
             
             whales = await blockscout_client.get_recent_whales()
+            print(f"📊 Query result: Found {len(whales)} whales")
             
             if whales:
                 response = f"🐋 **Recent Whale Activity** (${ALERT_THRESHOLD_USD:,}+ deposits)\n\n"
@@ -636,8 +740,20 @@ async def handle_whale_query_internal(ctx: Context, sender: str, msg: WhaleQuery
                 
                 if len(whales) > 5:
                     response += f"... and {len(whales) - 5} more whale deposits\n"
+                    
+                # Add debug info to response
+                response += f"\n🔍 **Debug Info:**\n"
+                response += f"- Searched last {LOOKBACK_MINUTES_DEFAULT} minutes\n"
+                response += f"- Bridge contract: `{BRIDGE_CONTRACT_ADDRESS[:10]}...`\n"
+                response += f"- Total whales found: {len(whales)}\n"
+                response += f"- FastMCP Agent: {FASTMCP_AGENT_ADDRESS[:20]}...\n"
             else:
-                response = f"No whale deposits above ${ALERT_THRESHOLD_USD:,} found in the last {LOOKBACK_MINUTES_DEFAULT} minutes."
+                response = f"No whale deposits above ${ALERT_THRESHOLD_USD:,} found in the last {LOOKBACK_MINUTES_DEFAULT} minutes.\n\n"
+                response += f"🔍 **Debug Info:**\n"
+                response += f"- Searched bridge contract: `{BRIDGE_CONTRACT_ADDRESS[:10]}...`\n"
+                response += f"- Time window: {LOOKBACK_MINUTES_DEFAULT} minutes\n"
+                response += f"- Threshold: ${ALERT_THRESHOLD_USD:,}\n"
+                response += f"- FastMCP Agent: {FASTMCP_AGENT_ADDRESS[:20]}...\n"
         
         # Check if it's a wallet address (starts with 0x and is 42 characters)
         elif msg.query.startswith("0x") and len(msg.query) == 42:
@@ -753,6 +869,14 @@ async def handle_wallet_enrichment(ctx: Context, sender: str, msg: WalletEnrichm
 
 # Include the chat protocol in the agent with manifest publishing for ASI:One compatibility
 # This must be done AFTER all message handlers are defined
+# Add FastMCP message handlers
+@agent.on_message(model=MCPToolResponse)
+async def handle_fastmcp_response(ctx: Context, sender: str, msg: MCPToolResponse):
+    """Handle responses from FastMCP uAgent"""
+    ctx.logger.info(f"Received FastMCP response from {sender}: success={msg.success}")
+    # This handler is for receiving responses - the actual processing is done in _call_mcp_tool
+    pass
+
 agent.include(protocol, publish_manifest=True)
 
 if __name__ == "__main__":
