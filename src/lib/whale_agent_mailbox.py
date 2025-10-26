@@ -8,11 +8,32 @@ and whale activities across multiple blockchains.
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 import requests
-from uagents import Agent, Context, Model
+from uuid import uuid4
+from uagents import Agent, Context, Model, Protocol
 from uagents.setup import fund_agent_if_low
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Import chat protocol for ASI:One compatibility
+try:
+    from uagents_core.contrib.protocols.chat import (
+        ChatMessage,
+        ChatAcknowledgement,
+        TextContent,
+        EndSessionContent,
+        chat_protocol_spec
+    )
+    CHAT_PROTOCOL_AVAILABLE = True
+except ImportError:
+    # Fallback if chat protocol is not available
+    CHAT_PROTOCOL_AVAILABLE = False
+    print("⚠️  Chat protocol not available - ASI:One compatibility limited")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +46,11 @@ AGENT_SEED = "hyperliquid_whale_detection_seed_phrase_2024"
 # Blockscout MCP server configuration
 BLOCKSCOUT_MCP_URL = "https://mcp.blockscout.com"
 BLOCKSCOUT_MCP_ENDPOINT = f"{BLOCKSCOUT_MCP_URL}/mcp"
+
+# ASI:One configuration from environment
+ASI_ONE_BASE_URL = os.getenv("NEXT_PUBLIC_ASI_ONE_URL", "https://api.asi.one")
+ASI_ONE_API_KEY = os.getenv("ASI_ONE_API_KEY")
+WHALE_AGENT_ADDRESS = os.getenv("NEXT_PUBLIC_WHALE_AGENT_ADDRESS")
 
 # Whale detection thresholds
 WHALE_THRESHOLD_USD = 100000  # $100k+ transactions
@@ -58,9 +84,17 @@ class QueryMessage(Model):
 agent = Agent(
     name="hyperliquid_whale_watcher_mailbox",
     seed=AGENT_SEED,
-    mailbox=AGENT_MAILBOX_KEY,
+    mailbox=True,
     endpoint=["https://agentverse.ai/v1/submit"],
 )
+
+# Create chat protocol for ASI:One compatibility (but don't include it yet)
+if CHAT_PROTOCOL_AVAILABLE:
+    chat_protocol = Protocol(spec=chat_protocol_spec)
+    print("✅ Chat protocol created for ASI:One compatibility")
+else:
+    chat_protocol = None
+    print("⚠️  Chat protocol not available - agent will work but ASI:One @ mentions may not work")
 
 # Global state
 monitored_chains: Dict[int, ChainMonitorStatus] = {}
@@ -374,6 +408,95 @@ class BlockscoutMCPClient:
 # Initialize Blockscout MCP client
 blockscout_client = BlockscoutMCPClient(BLOCKSCOUT_MCP_ENDPOINT)
 
+class ASIOneClient:
+    """Client for communicating with ASI:One API"""
+    
+    def __init__(self, base_url: str, api_key: str, agent_address: str = None):
+        self.base_url = base_url.rstrip('/')
+        self.api_key = api_key
+        self.agent_address = agent_address
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {api_key}' if api_key else None
+        })
+    
+    def is_configured(self) -> bool:
+        """Check if ASI:One is properly configured"""
+        return bool(self.base_url and self.api_key)
+    
+    async def send_message(self, message: str, conversation_id: str = None) -> Dict[str, Any]:
+        """Send a message to ASI:One API"""
+        if not self.is_configured():
+            raise ValueError("ASI:One not configured - missing API key or base URL")
+        
+        try:
+            payload = {
+                "model": "gpt-4",
+                "messages": [
+                    {
+                        "role": "user", 
+                        "content": message
+                    }
+                ],
+                "max_tokens": 1000,
+                "temperature": 0.7
+            }
+            
+            # Add agent address if available
+            if self.agent_address:
+                payload["agent_address"] = self.agent_address
+            
+            # Add conversation ID if provided
+            if conversation_id:
+                payload["conversation_id"] = conversation_id
+            
+            logger.info(f"Sending message to ASI:One: {self.base_url}/v1/chat/completions")
+            response = self.session.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+                timeout=30
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            # Extract the message content from the response
+            if "choices" in result and len(result["choices"]) > 0:
+                content = result["choices"][0].get("message", {}).get("content", "")
+                return {
+                    "success": True,
+                    "content": content,
+                    "raw_response": result
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": "No response content received from ASI:One",
+                    "raw_response": result
+                }
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"ASI:One API request failed: {e}")
+            return {
+                "success": False,
+                "error": f"ASI:One API error: {str(e)}"
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error in ASI:One communication: {e}")
+            return {
+                "success": False,
+                "error": f"Unexpected error: {str(e)}"
+            }
+
+# Initialize ASI:One client if configured
+asi_one_client = None
+if ASI_ONE_API_KEY and ASI_ONE_BASE_URL:
+    asi_one_client = ASIOneClient(ASI_ONE_BASE_URL, ASI_ONE_API_KEY, WHALE_AGENT_ADDRESS)
+    logger.info("✅ ASI:One client initialized")
+else:
+    logger.warning("⚠️  ASI:One not configured - missing API key or base URL")
+
 @agent.on_event("startup")
 async def startup_handler(ctx: Context):
     """Initialize the whale detection agent"""
@@ -604,10 +727,12 @@ async def handle_query(ctx: Context, sender: str, msg: QueryMessage):
     
     if "status" in msg.message.lower():
         status_report = generate_status_report()
-        await ctx.send(sender, status_report)
+        response = QueryMessage(message=status_report)
+        await ctx.send(sender, response)
     elif "alerts" in msg.message.lower():
         alerts_report = generate_alerts_report()
-        await ctx.send(sender, alerts_report)
+        response = QueryMessage(message=alerts_report)
+        await ctx.send(sender, response)
     else:
         help_msg = """
 🐋 Hyperliquid Whale Watcher Commands:
@@ -615,7 +740,8 @@ async def handle_query(ctx: Context, sender: str, msg: QueryMessage):
 - 'alerts' - Get recent whale alerts
 - 'help' - Show this help message
         """
-        await ctx.send(sender, help_msg)
+        response = QueryMessage(message=help_msg)
+        await ctx.send(sender, response)
 
 def generate_status_report() -> str:
     """Generate a status report of monitoring activities"""
@@ -667,7 +793,86 @@ def generate_alerts_report() -> str:
     
     return report
 
+# Chat protocol handlers for ASI:One compatibility
+if CHAT_PROTOCOL_AVAILABLE:
+    @chat_protocol.on_message(model=ChatMessage)
+    async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
+        """Handle chat messages from ASI:One and other chat interfaces"""
+        try:
+            logger.info(f"📨 Received chat message from {sender}: {msg.content}")
+            
+            # Extract text content from the message
+            text = ''
+            for item in msg.content:
+                if isinstance(item, TextContent):
+                    text += item.text
+            
+            # Process the message using the same logic as QueryMessage
+            response_text = ""
+            
+            if "status" in text.lower():
+                response_text = generate_status_report()
+            elif "alert" in text.lower() or "whale" in text.lower():
+                response_text = generate_alerts_report()
+            elif "help" in text.lower():
+                response_text = """
+🐋 Hyperliquid Whale Watcher Commands:
+• "status" - Get monitoring status for all chains
+• "alerts" - Get recent whale activity alerts
+• "help" - Show this help message
+
+I monitor large transactions (>$100k) and whale activities across multiple blockchains including Ethereum, Polygon, BSC, and more.
+"""
+            else:
+                response_text = f"""
+🐋 Hello! I'm the Hyperliquid Whale Watcher.
+
+I monitor whale activities and large transactions across multiple blockchains.
+
+Available commands:
+• "status" - Current monitoring status
+• "alerts" - Recent whale alerts
+• "help" - Show help
+
+Your message: "{text}"
+"""
+            
+            # Send acknowledgment first
+            await ctx.send(sender, ChatAcknowledgement(
+                timestamp=datetime.now(),
+                acknowledged_msg_id=msg.msg_id
+            ))
+            
+            # Send response as ChatMessage
+            await ctx.send(sender, ChatMessage(
+                timestamp=datetime.now(),
+                msg_id=uuid4(),
+                content=[
+                    TextContent(type="text", text=response_text),
+                    EndSessionContent(type="end-session")
+                ]
+            ))
+            
+            logger.info(f"✅ Sent chat response to {sender}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error handling chat message: {e}")
+            # Send error acknowledgment
+            await ctx.send(sender, ChatAcknowledgement(
+                timestamp=datetime.now(),
+                acknowledged_msg_id=msg.msg_id
+            ))
+
 if __name__ == "__main__":
     print("🐋 Starting Hyperliquid Whale Watcher Agent (Mailbox Version)...")
     print("Initializing agent...")
+    
+    # Include chat protocol after all handlers are defined
+    if CHAT_PROTOCOL_AVAILABLE and chat_protocol:
+        try:
+            agent.include(chat_protocol, publish_manifest=True)
+            print("✅ Chat protocol included for ASI:One compatibility")
+        except Exception as e:
+            print(f"⚠️  Failed to include chat protocol: {e}")
+    
     agent.run()

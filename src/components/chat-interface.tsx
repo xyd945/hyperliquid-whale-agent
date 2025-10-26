@@ -1,26 +1,41 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import { Send, Loader2, Fish, TrendingUp } from 'lucide-react';
+import { Send, Loader2, Fish, TrendingUp, Wifi, WifiOff, Settings, Search } from 'lucide-react';
+import { asiOneClient, AgentDiscoveryResult } from '@/lib/asi-one';
 
 interface Message {
   id: string;
   content: string;
   isUser: boolean;
   timestamp: Date;
+  source?: 'local-mailbox' | 'asi-one';
+}
+
+interface ConnectionStatus {
+  local: boolean;
+  asiOne: boolean;
+  activeAgent?: AgentDiscoveryResult;
 }
 
 export default function ChatInterface() {
   const [messages, setMessages] = useState<Message[]>([
     {
       id: '1',
-      content: "👋 Welcome to Hyperliquid Whale Watcher! I can help you track large deposits and analyze whale trading activity. Try asking 'show recent whales' or provide a wallet address to analyze.",
+      content: "👋 Welcome to Hyperliquid Whale Watcher! I can help you track large deposits and analyze whale trading activity. Try asking 'status', 'alerts', or 'help' for available commands.",
       isUser: false,
       timestamp: new Date()
     }
   ]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>({
+    local: false,
+    asiOne: false
+  });
+  const [availableAgents, setAvailableAgents] = useState<AgentDiscoveryResult[]>([]);
+  const [showAgentSelector, setShowAgentSelector] = useState(false);
+  const [preferLocal, setPreferLocal] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -30,6 +45,49 @@ export default function ChatInterface() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  // Check connection status and discover agents on component mount
+  useEffect(() => {
+    checkConnectionStatus();
+    discoverAgents();
+  }, []);
+
+  const checkConnectionStatus = async () => {
+    try {
+      const response = await fetch('/api/whale');
+      if (response.ok) {
+        const data = await response.json();
+        setConnectionStatus({
+          local: data.communication?.localMailbox?.configured || false,
+          asiOne: data.communication?.asiOne?.configured || false
+        });
+      }
+    } catch (error) {
+      console.error('Failed to check connection status:', error);
+    }
+  };
+
+  const discoverAgents = async () => {
+    try {
+      console.log('Starting agent discovery...');
+      const agents = await asiOneClient.discoverAgents();
+      console.log('Discovered agents:', agents);
+      setAvailableAgents(agents);
+      
+      // Set the first available agent as active
+      if (agents.length > 0) {
+        console.log('Setting active agent:', agents[0]);
+        setConnectionStatus(prev => ({
+          ...prev,
+          activeAgent: agents[0]
+        }));
+      } else {
+        console.log('No agents discovered');
+      }
+    } catch (error) {
+      console.error('Failed to discover agents:', error);
+    }
+  };
 
   const sendMessage = async () => {
     if (!input.trim() || isLoading) return;
@@ -46,26 +104,87 @@ export default function ChatInterface() {
     setIsLoading(true);
 
     try {
-      const response = await fetch('/api/whale', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ message: input.trim() }),
-      });
+      let response;
+      let source: 'local-mailbox' | 'asi-one' = 'local-mailbox';
 
-      const data = await response.json();
+      console.log('Sending message with preferLocal:', preferLocal);
+      console.log('Connection status:', connectionStatus);
 
-      if (data.success) {
-        const botMessage: Message = {
-          id: (Date.now() + 1).toString(),
-          content: data.response,
-          isUser: false,
-          timestamp: new Date()
-        };
-        setMessages(prev => [...prev, botMessage]);
+      if (preferLocal && connectionStatus.local) {
+        // Try local mailbox first
+        console.log('Using local mailbox');
+        response = await fetch('/api/mailbox', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ 
+            to: 'whale-agent',
+            message: input.trim(),
+            type: 'query'
+          }),
+        });
+      } else if (!preferLocal && connectionStatus.asiOne) {
+        // Use ASI:One - find the ASI:One agent from available agents
+        const asiOneAgent = availableAgents.find(agent => agent.source === 'asi-one');
+        console.log('Using ASI:One with agent:', asiOneAgent);
+        
+        if (asiOneAgent) {
+          const asiResponse = await asiOneClient.sendMessage(
+            input.trim(),
+            asiOneAgent.address
+          );
+          
+          if (asiResponse.success) {
+             response = {
+               ok: true,
+               json: async () => ({
+                 success: true,
+                 response: asiResponse.message || 'No response received',
+                 source: 'asi-one'
+               })
+             };
+             source = 'asi-one';
+           } else {
+             throw new Error(asiResponse.error || 'ASI:One communication failed');
+           }
+        } else {
+          throw new Error('ASI:One agent not available');
+        }
       } else {
-        throw new Error(data.error || 'Failed to get response');
+        console.log('No communication method available - preferLocal:', preferLocal, 'connectionStatus:', connectionStatus);
+        throw new Error('No communication method available');
+      }
+
+      if (response && response.ok) {
+        const data = await response.json();
+        
+        if (data.success) {
+          // Handle different response formats
+          let responseText = '';
+          if (data.response) {
+            responseText = data.response; // Mailbox format
+          } else if (data.message) {
+            responseText = data.message; // ASI:One format
+          } else if (data.data) {
+            responseText = data.data; // Alternative format
+          } else {
+            responseText = JSON.stringify(data, null, 2);
+          }
+
+          const botMessage: Message = {
+            id: (Date.now() + 1).toString(),
+            content: responseText,
+            isUser: false,
+            timestamp: new Date(),
+            source: data.source || source
+          };
+          setMessages(prev => [...prev, botMessage]);
+        } else {
+          throw new Error(data.error || 'Failed to get response');
+        }
+      } else {
+        throw new Error('Failed to get response');
       }
     } catch (error) {
       const errorMessage: Message = {
@@ -102,19 +221,114 @@ export default function ChatInterface() {
 
   return (
     <div className="flex flex-col h-full max-w-4xl mx-auto">
-      {/* Header */}
+      {/* Header with connection status and controls */}
       <div className="flex-shrink-0 border-b border-gray-200 dark:border-gray-700 p-4">
-        <div className="flex items-center space-x-3">
-          <div className="w-10 h-10 bg-blue-500 rounded-full flex items-center justify-center">
-            <Fish className="w-6 h-6 text-white" />
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-3">
+            <div className="w-10 h-10 bg-blue-500 rounded-full flex items-center justify-center">
+              <Fish className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
+                Hyperliquid Whale Watcher
+              </h2>
+              <p className="text-sm text-gray-500 dark:text-gray-400">
+                Real-time whale detection and trading intelligence
+              </p>
+            </div>
           </div>
-          <div>
-            <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
-              Hyperliquid Whale Watcher
-            </h2>
-            <p className="text-sm text-gray-500 dark:text-gray-400">
-              Real-time whale detection and trading intelligence
-            </p>
+          
+          {/* Connection Status and Controls */}
+          <div className="flex items-center space-x-4">
+            {/* Connection Status Indicators */}
+            <div className="flex items-center space-x-2">
+              <div className="flex items-center space-x-1">
+                {connectionStatus.local ? (
+                  <Wifi className="h-4 w-4 text-green-500" />
+                ) : (
+                  <WifiOff className="h-4 w-4 text-gray-400" />
+                )}
+                <span className="text-xs text-gray-600 dark:text-gray-400">Local</span>
+              </div>
+              <div className="flex items-center space-x-1">
+                {connectionStatus.asiOne ? (
+                  <Wifi className="h-4 w-4 text-blue-500" />
+                ) : (
+                  <WifiOff className="h-4 w-4 text-gray-400" />
+                )}
+                <span className="text-xs text-gray-600 dark:text-gray-400">ASI:One</span>
+              </div>
+            </div>
+
+            {/* Agent Selector */}
+            {availableAgents.length > 0 && (
+              <div className="relative">
+                <button
+                  onClick={() => setShowAgentSelector(!showAgentSelector)}
+                  className="flex items-center space-x-1 px-3 py-1 bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300 rounded-md hover:bg-blue-200 dark:hover:bg-blue-800 transition-colors"
+                >
+                  <Search className="h-4 w-4" />
+                  <span className="text-sm">
+                    {connectionStatus.activeAgent?.name || 'Select Agent'}
+                  </span>
+                </button>
+                
+                {showAgentSelector && (
+                  <div className="absolute right-0 mt-2 w-64 bg-white dark:bg-gray-800 rounded-md shadow-lg border dark:border-gray-600 z-10">
+                    <div className="p-2">
+                      <div className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">Available Agents</div>
+                      {availableAgents.map((agent, index) => (
+                        <button
+                          key={agent.address}
+                          onClick={() => {
+                            setConnectionStatus(prev => ({ ...prev, activeAgent: agent }));
+                            setShowAgentSelector(false);
+                          }}
+                          className={`w-full text-left p-2 rounded hover:bg-gray-50 dark:hover:bg-gray-700 ${
+                            connectionStatus.activeAgent?.address === agent.address
+                              ? 'bg-blue-50 dark:bg-blue-900 border-l-2 border-blue-500'
+                              : ''
+                          }`}
+                        >
+                          <div className="font-medium text-sm text-gray-900 dark:text-white">{agent.name}</div>
+                          <div className="text-xs text-gray-500 dark:text-gray-400 truncate">{agent.description}</div>
+                          <div className="flex items-center space-x-2 mt-1">
+                            <span className={`inline-block w-2 h-2 rounded-full ${
+                              agent.isOnline ? 'bg-green-400' : 'bg-gray-400'
+                            }`}></span>
+                            <span className="text-xs text-gray-400">{agent.source}</span>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Communication Preference Toggle */}
+            <div className="flex items-center space-x-2">
+              <label className="flex items-center space-x-1 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={preferLocal}
+                  onChange={(e) => setPreferLocal(e.target.checked)}
+                  className="rounded"
+                />
+                <span className="text-xs text-gray-600 dark:text-gray-400">Prefer Local</span>
+              </label>
+            </div>
+
+            {/* Refresh Button */}
+            <button
+              onClick={() => {
+                checkConnectionStatus();
+                discoverAgents();
+              }}
+              className="p-2 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-md transition-colors"
+            >
+              <Settings className="h-4 w-4" />
+            </button>
           </div>
         </div>
       </div>
@@ -137,12 +351,23 @@ export default function ChatInterface() {
                 className="whitespace-pre-wrap"
                 dangerouslySetInnerHTML={{ __html: formatMessage(message.content) }}
               />
-              <div
-                className={`text-xs mt-1 ${
-                  message.isUser ? 'text-blue-100' : 'text-gray-500 dark:text-gray-400'
-                }`}
-              >
-                {message.timestamp.toLocaleTimeString()}
+              <div className="flex items-center justify-between mt-1">
+                <div
+                  className={`text-xs ${
+                    message.isUser ? 'text-blue-100' : 'text-gray-500 dark:text-gray-400'
+                  }`}
+                >
+                  {message.timestamp.toLocaleTimeString()}
+                </div>
+                {!message.isUser && message.source && (
+                  <span className={`text-xs px-1.5 py-0.5 rounded ${
+                    message.source === 'local-mailbox' 
+                      ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'
+                      : 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300'
+                  }`}>
+                    {message.source === 'local-mailbox' ? 'Local' : 'ASI:One'}
+                  </span>
+                )}
               </div>
             </div>
           </div>

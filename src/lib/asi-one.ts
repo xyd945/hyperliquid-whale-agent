@@ -7,6 +7,7 @@ export interface ASIOneConfig {
   apiKey?: string;
   baseUrl: string;
   agentAddress?: string;
+  localMailboxUrl?: string;
 }
 
 export interface ASIOneMessage {
@@ -20,6 +21,16 @@ export interface ASIOneResponse {
   message?: string;
   data?: any;
   error?: string;
+  source?: 'asi-one' | 'local-mailbox';
+}
+
+export interface AgentDiscoveryResult {
+  address: string;
+  name: string;
+  description: string;
+  capabilities: string[];
+  isOnline: boolean;
+  source: 'asi-one' | 'local';
 }
 
 export class ASIOneClient {
@@ -30,14 +41,26 @@ export class ASIOneClient {
   }
 
   /**
-   * Send message to Agentverse agent via ASI:ONE
+   * Send message to agent via ASI:ONE or local mailbox
    */
-  async sendMessage(message: string, agentAddress?: string): Promise<ASIOneResponse> {
+  async sendMessage(message: string, agentAddress?: string, preferLocal = false): Promise<ASIOneResponse> {
     try {
       const targetAgent = agentAddress || this.config.agentAddress;
       
       if (!targetAgent) {
         throw new Error('Agent address is required');
+      }
+
+      // Try local mailbox first if preferred or if it's configured
+      if (preferLocal && this.config.localMailboxUrl) {
+        try {
+          const localResponse = await this.sendToLocalMailbox(message, targetAgent);
+          if (localResponse.success) {
+            return { ...localResponse, source: 'local-mailbox' };
+          }
+        } catch (error) {
+          console.warn('Local mailbox failed, falling back to ASI:ONE:', error);
+        }
       }
 
       // Use the correct ASI:ONE chat completions endpoint
@@ -78,7 +101,8 @@ export class ASIOneClient {
       return {
         success: true,
         message: assistantMessage,
-        data
+        data,
+        source: 'asi-one'
       };
     } catch (error) {
       console.error('ASI:ONE API error:', error);
@@ -86,6 +110,127 @@ export class ASIOneClient {
         success: false,
         error: error instanceof Error ? error.message : 'Unknown error'
       };
+    }
+  }
+
+  /**
+   * Send message to local mailbox agent
+   */
+  private async sendToLocalMailbox(message: string, agentAddress: string): Promise<ASIOneResponse> {
+    if (!this.config.localMailboxUrl) {
+      throw new Error('Local mailbox URL not configured');
+    }
+
+    const response = await fetch(`${this.config.localMailboxUrl}/send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        to: agentAddress,
+        message: message,
+        type: 'query'
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Local mailbox error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    
+    return {
+      success: true,
+      message: data.response || data.message || 'Response received',
+      data
+    };
+  }
+
+  /**
+   * Discover available whale agents
+   */
+  async discoverAgents(): Promise<AgentDiscoveryResult[]> {
+    const agents: AgentDiscoveryResult[] = [];
+
+    // Check local mailbox agent
+    if (this.config.localMailboxUrl && this.config.agentAddress) {
+      try {
+        const localAgent = await this.checkLocalAgent();
+        if (localAgent) {
+          agents.push(localAgent);
+        }
+      } catch (error) {
+        console.warn('Failed to check local agent:', error);
+      }
+    }
+
+    // Discover agents via ASI:ONE
+    try {
+      const asiAgents = await this.discoverASIOneAgents();
+      agents.push(...asiAgents);
+    } catch (error) {
+      console.warn('Failed to discover ASI:ONE agents:', error);
+    }
+
+    return agents;
+  }
+
+  /**
+   * Check if local whale agent is available
+   */
+  private async checkLocalAgent(): Promise<AgentDiscoveryResult | null> {
+    if (!this.config.localMailboxUrl || !this.config.agentAddress) {
+      return null;
+    }
+
+    try {
+      const response = await fetch(`${this.config.localMailboxUrl}/status`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        }
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        return {
+          address: this.config.agentAddress,
+          name: 'Local Whale Agent',
+          description: 'Local Hyperliquid whale tracking agent with real-time monitoring',
+          capabilities: ['whale-tracking', 'deposit-monitoring', 'trading-analysis', 'real-time-alerts'],
+          isOnline: data.status === 'online' || data.running === true,
+          source: 'local'
+        };
+      }
+    } catch (error) {
+      console.warn('Local agent check failed:', error);
+    }
+
+    return null;
+  }
+
+  /**
+   * Discover whale agents via ASI:ONE
+   */
+  private async discoverASIOneAgents(): Promise<AgentDiscoveryResult[]> {
+    try {
+      // For now, return a default agent since we know ASI:One is configured
+      // In the future, this could search for actual agents via ASI:One API
+      if (this.config.agentAddress) {
+        return [{
+          address: this.config.agentAddress,
+          name: 'Whale Agent (ASI:One)',
+          description: 'Hyperliquid whale tracking agent via ASI:One',
+          capabilities: ['whale-tracking', 'market-analysis', 'trading-insights'],
+          isOnline: true,
+          source: 'asi-one' as const
+        }];
+      }
+      
+      return [];
+    } catch (error) {
+      console.error('ASI:ONE agent discovery failed:', error);
+      return [];
     }
   }
 
@@ -162,9 +307,10 @@ export class ASIOneClient {
 
 // Default configuration for development
 const defaultConfig: ASIOneConfig = {
-  baseUrl: process.env.NEXT_PUBLIC_ASI_ONE_URL || 'https://api.asi.one',
-  apiKey: process.env.ASI_ONE_API_KEY,
-  agentAddress: process.env.NEXT_PUBLIC_WHALE_AGENT_ADDRESS
+  baseUrl: process.env.NEXT_PUBLIC_ASI_ONE_URL || 'https://api.asi1.ai',
+  apiKey: process.env.NEXT_PUBLIC_ASI_ONE_API_KEY,
+  agentAddress: process.env.NEXT_PUBLIC_WHALE_AGENT_ADDRESS || 'agent1qfe8jqus8ka24sneygllla33uv5qxcc63rq6pxqmpmhk3mcga72mungnmne',
+  localMailboxUrl: process.env.NEXT_PUBLIC_LOCAL_MAILBOX_URL || 'http://localhost:8000'
 };
 
 // Export singleton instance
@@ -172,5 +318,10 @@ export const asiOneClient = new ASIOneClient(defaultConfig);
 
 // Utility function to check if ASI:ONE is configured
 export function isASIOneConfigured(): boolean {
-  return !!(defaultConfig.baseUrl && defaultConfig.agentAddress);
+  return !!(defaultConfig.baseUrl && defaultConfig.apiKey && defaultConfig.agentAddress);
+}
+
+// Utility function to check if local mailbox is available
+export function isLocalMailboxConfigured(): boolean {
+  return !!(defaultConfig.localMailboxUrl && defaultConfig.agentAddress);
 }
