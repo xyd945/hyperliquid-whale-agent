@@ -14,6 +14,7 @@ import requests
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 from uuid import uuid4
+import asyncio
 from openai import OpenAI
 from uagents import Agent, Context, Model, Protocol
 from pydantic import BaseModel
@@ -82,11 +83,13 @@ class WalletEnrichmentRequest(Model):
 class MCPToolRequest(Model):
     tool_name: str
     arguments: Dict[str, Any]
+    correlation_id: str  # Add correlation ID for matching requests/responses
 
 class MCPToolResponse(Model):
     success: bool
     result: Dict[str, Any]
     error: Optional[str] = None
+    correlation_id: str  # Add correlation ID for matching requests/responses
 
 # Data Classes
 class WhaleDeposit:
@@ -126,8 +129,10 @@ class EnrichedWallet:
 class BlockscoutMCPClient:
     def __init__(self, fastmcp_agent_address: str = FASTMCP_AGENT_ADDRESS):
         self.fastmcp_agent_address = fastmcp_agent_address
-        self.session = None
-        self.context = None  # Will be set by the agent
+        self.context = None
+        self._session = None
+        # Store pending requests for async communication
+        self.pending_requests: Dict[str, asyncio.Future] = {}  # Will be set by the agent
 
     def set_context(self, context: Context):
         """Set the uAgent context for sending messages"""
@@ -140,36 +145,36 @@ class BlockscoutMCPClient:
         return self.session
 
     async def _call_mcp_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Call a tool via the FastMCP uAgent"""
+        """Call a tool via the FastMCP uAgent using proper async message passing"""
         print(f"🔧 FastMCP Tool Call: {tool_name} with args: {arguments}")
         
         try:
             if self.context:
-                # Send request to FastMCP uAgent
-                print(f"📡 Sending request to FastMCP uAgent: {self.fastmcp_agent_address}")
-                print(f"🔍 DEBUG: FastMCP address type: {type(self.fastmcp_agent_address)}")
-                print(f"🔍 DEBUG: FastMCP address value: '{self.fastmcp_agent_address}'")
-                print(f"🔍 DEBUG: FastMCP address length: {len(self.fastmcp_agent_address)}")
+                # Generate correlation ID for this request
+                correlation_id = str(uuid4())
+                print(f"📡 Sending async request to FastMCP uAgent: {self.fastmcp_agent_address}")
+                print(f"🔍 DEBUG: Correlation ID: {correlation_id}")
+                
+                # Create future to wait for response
+                response_future = asyncio.Future()
+                self.pending_requests[correlation_id] = response_future
                 
                 request = MCPToolRequest(
                     tool_name=tool_name,
-                    arguments=arguments
+                    arguments=arguments,
+                    correlation_id=correlation_id
                 )
                 
                 print(f"🔍 DEBUG: Sending MCPToolRequest: {request}")
-                print(f"🔍 DEBUG: Request model fields: {request.model_fields}")
                 
-                # Send message and wait for response
-                response = await self.context.send(
-                    self.fastmcp_agent_address,
-                    request,
-                    timeout=30.0
-                )
+                # Send message asynchronously (no timeout, no waiting for return)
+                await self.context.send(self.fastmcp_agent_address, request)
+                print(f"📤 Sent async request, waiting for response...")
                 
-                print(f"🔍 DEBUG: Received response type: {type(response)}")
-                print(f"🔍 DEBUG: Response content: {response}")
-                
-                if isinstance(response, MCPToolResponse):
+                # Wait for response with timeout
+                try:
+                    response = await asyncio.wait_for(response_future, timeout=30.0)
+                    
                     if response.success:
                         print(f"✅ FastMCP result for {tool_name}: {type(response.result)} - {len(str(response.result))} chars")
                         if isinstance(response.result, dict) and "items" in response.result:
@@ -178,10 +183,15 @@ class BlockscoutMCPClient:
                     else:
                         print(f"❌ FastMCP tool call failed for {tool_name}: {response.error}")
                         raise Exception(f"FastMCP error: {response.error}")
-                else:
-                    print(f"❌ Unexpected response type from FastMCP: {type(response)}")
-                    print(f"🔍 DEBUG: Response details: {response}")
-                    raise Exception(f"Unexpected response type: {type(response)}")
+                        
+                except asyncio.TimeoutError:
+                    print(f"⏰ FastMCP request timeout for {tool_name}")
+                    # Clean up pending request
+                    self.pending_requests.pop(correlation_id, None)
+                    raise Exception(f"FastMCP timeout for {tool_name}")
+                finally:
+                    # Clean up pending request if still exists
+                    self.pending_requests.pop(correlation_id, None)
             else:
                 print(f"❌ No context available for FastMCP communication")
                 raise Exception("No context available for FastMCP communication")
@@ -616,11 +626,11 @@ async def startup_handler(ctx: Context):
     blockscout_client.set_context(ctx)
     ctx.logger.info(f"🔍 DEBUG: blockscout_client.fastmcp_agent_address: '{blockscout_client.fastmcp_agent_address}'")
     
-    # Test FastMCP connection
+    # Test FastMCP connection using a valid tool
     try:
         ctx.logger.info("Testing FastMCP connection...")
-        test_result = await blockscout_client._call_mcp_tool("test_connection", {})
-        ctx.logger.info(f"FastMCP connection test result: {test_result}")
+        test_result = await blockscout_client._call_mcp_tool("get_chains_list", {})
+        ctx.logger.info(f"FastMCP connection test result: {len(str(test_result))} chars received")
     except Exception as e:
         ctx.logger.warning(f"FastMCP connection test failed (will use HTTP fallback): {e}")
     
@@ -873,9 +883,19 @@ async def handle_wallet_enrichment(ctx: Context, sender: str, msg: WalletEnrichm
 @agent.on_message(model=MCPToolResponse)
 async def handle_fastmcp_response(ctx: Context, sender: str, msg: MCPToolResponse):
     """Handle responses from FastMCP uAgent"""
-    ctx.logger.info(f"Received FastMCP response from {sender}: success={msg.success}")
-    # This handler is for receiving responses - the actual processing is done in _call_mcp_tool
-    pass
+    ctx.logger.info(f"📨 Received FastMCP response from {sender}: success={msg.success}, correlation_id={msg.correlation_id}")
+    
+    # Find the pending request by correlation ID
+    if msg.correlation_id in blockscout_client.pending_requests:
+        future = blockscout_client.pending_requests[msg.correlation_id]
+        if not future.done():
+            # Complete the future with the response
+            future.set_result(msg)
+            ctx.logger.info(f"✅ Completed pending request {msg.correlation_id}")
+        else:
+            ctx.logger.warning(f"⚠️ Future for {msg.correlation_id} was already completed")
+    else:
+        ctx.logger.warning(f"⚠️ No pending request found for correlation_id: {msg.correlation_id}")
 
 agent.include(protocol, publish_manifest=True)
 
